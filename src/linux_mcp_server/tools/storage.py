@@ -310,3 +310,136 @@ async def read_file(
     ]
 
     return await attributes[0].execute(host)
+
+
+
+@mcp.tool(
+    title="Search file contents",
+    description="Search for a pattern in files using grep. Supports recursive search and file filtering.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+@log_tool_call
+@disallow_local_execution_in_containers
+async def search_files(
+    path: t.Annotated[str, Field(description="The directory path to search in")],
+    pattern: t.Annotated[str, Field(description="The search pattern (supports basic regex)")],
+    recursive: t.Annotated[
+        bool, Field(description="Search recursively in subdirectories (default: False)")
+    ] = False,
+    case_sensitive: t.Annotated[
+        bool, Field(description="Case-sensitive search (default: True)")
+    ] = True,
+    file_pattern: t.Annotated[
+        str | None,
+        Field(description="Filter by file pattern (e.g., '*.py', '*.log', '*.txt'). Uses shell wildcards."),
+    ] = None,
+    max_results: t.Annotated[
+        int | None,
+        Field(
+            description="Maximum number of matching lines to return (1-10000, default: 1000)",
+            gt=0,
+            le=10_000,
+        ),
+    ] = 1000,
+    show_line_numbers: t.Annotated[
+        bool, Field(description="Show line numbers in results (default: True)")
+    ] = True,
+    host: Host | None = None,
+) -> str:
+    """
+    Search for a pattern in files using grep.
+    
+    Returns matching lines with file names and optionally line numbers.
+    """
+    # For local execution, validate path
+    if not host:
+        path = _validate_path(path)
+        
+        if not os.path.isdir(path):
+            raise ToolError(f"Path is not a directory: {path}")
+    
+    # Build grep command
+    command = ["grep"]
+    
+    # Add options
+    if not case_sensitive:
+        command.append("-i")  # Case insensitive
+    
+    if show_line_numbers:
+        command.append("-n")  # Show line numbers
+    
+    if recursive:
+        command.append("-r")  # Recursive search
+    else:
+        command.append("-h")  # Don't show filenames for non-recursive
+    
+    # Add filename display for recursive searches
+    if recursive:
+        command.append("-H")  # Always show filename
+    
+    # Limit number of matches
+    if max_results:
+        command.extend(["-m", str(max_results)])
+    
+    # Add the pattern
+    command.append(pattern)
+    
+    # Add path or file pattern
+    if file_pattern:
+        # Use find to filter by file pattern, then pipe to grep
+        find_command = ["find", path]
+        
+        if not recursive:
+            find_command.extend(["-maxdepth", "1"])
+        
+        find_command.extend(["-type", "f", "-name", file_pattern])
+        
+        # Execute find to get matching files
+        try:
+            returncode, files_stdout, stderr = await execute_command(find_command, host=host)
+        except (ValueError, ConnectionError) as e:
+            raise ToolError(f"Error finding files: {str(e)}") from e
+        
+        if returncode != 0:
+            raise ToolError(f"Error finding files: {stderr}")
+        
+        matching_files = [f.strip() for f in files_stdout.strip().splitlines() if f.strip()]
+        
+        if not matching_files:
+            return f"No files matching pattern '{file_pattern}' found in {path}"
+        
+        # Add files to grep command
+        command.extend(matching_files)
+    else:
+        command.append(path)
+    
+    # Execute grep command
+    try:
+        returncode, stdout, stderr = await execute_command(command, host=host)
+    except (ValueError, ConnectionError) as e:
+        raise ToolError(f"Error executing search: {str(e)}") from e
+    
+    # grep returns 1 when no matches found, which is not an error
+    if returncode == 1:
+        return f"No matches found for pattern '{pattern}' in {path}"
+    
+    if returncode != 0 and returncode != 1:
+        raise ToolError(f"Error running grep: {stderr}")
+    
+    if not stdout.strip():
+        return f"No matches found for pattern '{pattern}' in {path}"
+    
+    # Format output
+    result = [f"=== Search Results for '{pattern}' in {path} ===\n"]
+    
+    lines = stdout.strip().splitlines()
+    total_matches = len(lines)
+    
+    result.append(f"Found {total_matches} matching line(s)\n")
+    
+    if total_matches > 100:
+        result.append("(Showing results - use max_results parameter to limit)\n")
+    
+    result.append(stdout)
+    
+    return "\n".join(result)
